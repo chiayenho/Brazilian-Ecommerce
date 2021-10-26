@@ -1,0 +1,174 @@
+---
+title: "HW2"
+author: "Vivian Ho, Yutong Liu, Ankita Baskaran, Adam Baker, Heamanth Baskaran"
+date: "10/24/2021"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r }
+## import library and data sets
+library(dplyr)
+library(tidyr)
+library(fastDummies)
+library(ggplot2)
+library(arules)
+library(geobr)
+library(sf)
+
+setwd("/Users/vivianho/Documents/r/data/olist_dataset")
+customer = read.csv("olist_customers_dataset.csv", stringsAsFactors = FALSE)
+order = read.csv("olist_orders_dataset.csv",stringsAsFactors = FALSE)
+products = read.csv("olist_products_dataset.csv",stringsAsFactors = FALSE)
+item = read.csv("olist_order_items_dataset.csv",stringsAsFactors = FALSE)
+geolocation = read.csv("olist_geolocation_dataset.csv",stringsAsFactors = FALSE)
+installment = read.csv("olist_order_payments_dataset.csv",stringsAsFactors = FALSE)
+name = read.csv("product_category_name_translation.csv",stringsAsFactors = FALSE)
+```
+
+
+```{r}
+# join data sets together
+orderall = left_join(order, customer, by = "customer_id")
+basket = left_join(item, orderall, by = "order_id")
+basket = left_join(basket, products, by = "product_id")
+basket = left_join(basket, name, by = "product_category_name")
+basket_raw = basket
+
+```
+
+
+### Using assication rules to find the relationships among product categories
+```{r}
+# turn data into dummy columns, we got 99441 customers and 73 products
+basket = basket %>% select(customer_id, order_item_id, product_category_name)
+basket = basket %>% filter(product_category_name != "" & customer_id != "")
+
+basket = basket %>% dummy_cols(select_columns = "product_category_name")
+basket_sum = basket %>% select(-product_category_name) %>% 
+  group_by(customer_id) %>% summarise_all(sum)
+
+make_binary = function(data) {return(ifelse(data > 0, TRUE, FALSE))}
+basket_sum = basket_sum %>% select(-customer_id, -order_item_id) %>% 
+  mutate_all(make_binary)
+```
+
+```{r}
+# user "arules" packages for association rules
+basket_sum_matrix = as.matrix(basket_sum)
+basket_sum_ar = as(basket_sum_matrix, "transactions")
+ars = apriori(data = basket_sum, parameter = list(supp = 0.00005, conf=0.01, minlen = 2),
+              control = list(memopt = TRUE, load = FALSE))
+#Inspecting the rules sorting with support
+inspect(sort(ars, by = "support"))
+```
+
+### Using kmeans to find the meaning customer groups
+```{r}
+# variables
+installment  = installment %>% filter(payment_installments>0)
+installment = installment %>% mutate(avg_installments = payment_value/payment_installments)
+
+installment = left_join(order, installment, by='order_id')
+installment = installment %>% group_by(customer_id) %>% 
+  summarise(mean_installment_amount = mean(avg_installments))
+
+spending =  basket_raw %>% group_by(customer_id, customer_state) %>%
+  summarise(total_spending = sum(price), mean_price = mean(price), n_order = n())
+
+spending_installment = left_join(spending, installment, by='customer_id')
+spending_installment = na.omit(spending_installment)
+spending_installment = spending_installment %>% filter(n_order>0)
+```
+
+```{r}
+# normalization
+normalize = function(x) {
+  return((x - min(x)) / (max(x) - min(x)))}
+spending_installment_1 = spending_installment[,c(4, 5, 6)] %>% mutate_all(normalize)
+```
+
+```{r}
+#k-means clustering
+# after look into the data, we decide to cluster into 3 groups
+kcluster = kmeans(spending_installment_1, centers = 3)
+kcluster$centers
+group = kcluster$cluster
+spending_installment$group = group
+```
+
+
+### Visualizations
+```{r}
+states = read_state(year=2019)
+
+by_state = basket_raw %>% group_by(customer_state) %>% 
+  summarise(mean_price = mean(price), n_order = n())
+
+states = left_join(states, by_state, by = c("abbrev_state"="customer_state"))
+
+# Average spending per order across states
+ggplot() +
+  geom_sf(data=states, aes(fill=mean_price), color= NA, size=.15) +
+  labs(title="Average spending per order across states", size=12) +
+  scale_fill_gradient(low="pink", high="red", name="price")+
+  theme_minimal() 
+```
+
+```{r}
+# map - numbers of orders in each areas
+ggplot() +
+  geom_sf(data=states, aes(fill=n_order), color= NA, size=.15, how.legend=TRUE) +
+  labs(title="Numbers of orders across states", size=12) +
+  scale_fill_gradient(low="gray", high="blue", name="")+
+  theme_minimal() 
+```
+
+```{r}
+# barplot -Top 10 frequently sold products
+plot_data = basket_raw %>%
+  group_by(product_category_name_english) %>%
+  summarise(count = n()) %>% arrange(desc(count))
+
+#Extract the subset of top 10 products
+plot_data <- plot_data[1:10,]
+#head(plot_data)
+library(ggplot2)
+ggplot(plot_data, aes(x = reorder((product_category_name_english),+count), y = count)) +
+  geom_bar(stat = "identity", fill='lightblue') +
+  labs(x = "Product category name", y = 'Count',  title = "Top 10 frequently sold products") +
+  theme_bw() + coord_flip() +
+  theme(text = element_text(size=10), plot.title = element_text(hjust = 0.5))
+```
+
+
+```{r}
+# Barplot - Products bought from different groups
+basket2 = basket_raw %>% select(customer_id, order_item_id, product_category_name_english)
+
+class_product = left_join(spending_installment, basket2, by ="customer_id")
+
+class_product_cnt = class_product %>% group_by(group) %>% 
+  count(product_category_name_english) 
+
+# for managerial document, we categorized 3 groups into 
+# 'Affluential customers', Conservative customers', and 'Value seekers'
+
+#class_product_cnt <- class_product_cnt %>% mutate(group_name = case_when(
+#  group == 2 ~ 'Affluential customers',
+#  group == 1 ~ 'Conservative customers',
+#  group == 3 ~ 'Value seekers', TRUE ~ as.character('none')) )
+
+
+class_product_cnt = class_product_cnt %>% arrange(desc(n))
+class_product_cnt = na.omit(class_product_cnt, cols="product_category_name_english")
+ggplot(class_product_cnt, aes(x = reorder(product_category_name_english,n), y = n , 
+                              fill = factor(group))) +
+  geom_bar(stat = "identity", width = 0.7) +
+  labs(title="Products bought from different group of customers",
+       x="Product category name", y="Count", fill="groups") +
+  coord_flip() + theme_bw()
+```
+
